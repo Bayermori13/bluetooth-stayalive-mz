@@ -9,6 +9,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.mz.bluetooth.stayalive.MainActivity
 import com.mz.bluetooth.stayalive.R
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlin.concurrent.thread
 import kotlin.math.sin
 
@@ -18,35 +19,47 @@ class KeepAliveService : Service() {
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
         const val EXTRA_MODE = "EXTRA_MODE"
-        
-        var isServiceActive = false
-            private set
-        var currentSignalMode = 1 // 0: سکوت مطلق، 1: 15 هرتز، 2: پالس هوشمند
-            private set
+
+        // وضعیت‌های زنده و مشترک بین برنامه و پس‌زمینه
+        val isRunningState = MutableStateFlow(false)
+        val signalModeState = MutableStateFlow(1)
+        val elapsedSecondsState = MutableStateFlow(0L)
     }
 
     private var audioTrack: AudioTrack? = null
     private var isStreaming = false
     private var streamThread: Thread? = null
+    private var timerThread: Thread? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START
-        val mode = intent?.getIntExtra(EXTRA_MODE, currentSignalMode) ?: 1
+        val mode = intent?.getIntExtra(EXTRA_MODE, signalModeState.value) ?: 1
 
         if (action == ACTION_STOP) {
             stopAudioStream()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
-            isServiceActive = false
+            isRunningState.value = false
             return START_NOT_STICKY
         }
 
-        currentSignalMode = mode
+        signalModeState.value = mode
+        isRunningState.value = true
         startForegroundWithStickyNotification()
         startAudioStream(mode)
-        isServiceActive = true
+        startTimer()
 
-        return START_STICKY // ماندگاری همیشگی شبیه فیلترشکن
+        return START_STICKY
+    }
+
+    private fun startTimer() {
+        if (timerThread?.isAlive == true) return
+        timerThread = thread(start = true) {
+            while (isRunningState.value) {
+                Thread.sleep(1000)
+                elapsedSecondsState.value += 1
+            }
+        }
     }
 
     private fun startForegroundWithStickyNotification() {
@@ -61,6 +74,7 @@ class KeepAliveService : Service() {
             ).apply {
                 description = "سرویس دائمی نگه‌دارنده اتصال هندزفری بلوتوث"
                 setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
             notificationManager.createNotificationChannel(channel)
         }
@@ -77,21 +91,26 @@ class KeepAliveService : Service() {
             PendingIntent.FLAG_IMMUTABLE
         )
 
-        val modeLabel = when(currentSignalMode) {
+        val modeLabel = when(signalModeState.value) {
             0 -> "سکوت مطلق (PCM 0dB)"
             1 -> "فرکانس نامحسوس (۱۵ هرتز)"
-            else -> "پالس هوشمند (Smart Pulse)"
+            else -> "پالس هوشمند صوتی"
         }
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_mz_logo)
             .setContentTitle("سرویس نگه‌دارنده MZ فعال است")
-            .setContentText("وضعیت سیگنال: $modeLabel")
-            .setOngoing(true) // غیرقابل کشیدن و غیرقابل حذف شدن
+            .setContentText("سیگنال: $modeLabel")
+            .setOngoing(true) // کاملاً ثابت و غیرقابل کشیدن با دست
+            .setAutoCancel(false)
+            .setOnlyAlertOnce(true)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(pendingOpen)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "خاموش کردن", pendingStop)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+
+        notification.flags = notification.flags or Notification.FLAG_NO_CLEAR or Notification.FLAG_ONGOING_EVENT
 
         startForeground(1001, notification)
     }
@@ -130,12 +149,12 @@ class KeepAliveService : Service() {
         streamThread = thread(start = true) {
             val buffer = ShortArray(bufferSize)
             var phase = 0.0
-            val frequency = 15.0 // 15 هرتز غیرقابل شنیدن برای گوش
+            val frequency = 15.0
             var pulseTick = 0
 
             while (isStreaming) {
                 when (mode) {
-                    0 -> buffer.fill(0) // سکوت مطلق
+                    0 -> buffer.fill(0)
                     1 -> {
                         for (i in buffer.indices) {
                             buffer[i] = (sin(phase) * 1200).toInt().toShort()
@@ -145,7 +164,7 @@ class KeepAliveService : Service() {
                     }
                     2 -> {
                         pulseTick++
-                        if (pulseTick % 100 < 5) {
+                        if (pulseTick % 100 < 6) {
                             for (i in buffer.indices) {
                                 buffer[i] = (sin(phase) * 800).toInt().toShort()
                                 phase += 2.0 * Math.PI * 18.0 / sampleRate
@@ -168,12 +187,14 @@ class KeepAliveService : Service() {
             audioTrack = null
             streamThread?.interrupt()
             streamThread = null
+            timerThread?.interrupt()
+            timerThread = null
         } catch (_: Exception) {}
     }
 
     override fun onDestroy() {
         stopAudioStream()
-        isServiceActive = false
+        isRunningState.value = false
         super.onDestroy()
     }
 
