@@ -18,16 +18,16 @@ class KeepAliveService : Service() {
     companion object {
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
+        const val ACTION_RESTORE_NOTIFICATION = "ACTION_RESTORE_NOTIFICATION"
         const val EXTRA_MODE = "EXTRA_MODE"
 
-        // وضعیت‌های زنده و مشترک بین برنامه و پس‌زمینه
         val isRunningState = MutableStateFlow(false)
         val signalModeState = MutableStateFlow(1)
         val elapsedSecondsState = MutableStateFlow(0L)
     }
 
     private var audioTrack: AudioTrack? = null
-    private var isStreaming = false
+    @Volatile private var isStreaming = false
     private var streamThread: Thread? = null
     private var timerThread: Thread? = null
 
@@ -35,11 +35,18 @@ class KeepAliveService : Service() {
         val action = intent?.action ?: ACTION_START
         val mode = intent?.getIntExtra(EXTRA_MODE, signalModeState.value) ?: 1
 
+        if (action == ACTION_RESTORE_NOTIFICATION) {
+            if (isRunningState.value) {
+                startForegroundWithStickyNotification()
+            }
+            return START_STICKY
+        }
+
         if (action == ACTION_STOP) {
+            isRunningState.value = false
             stopAudioStream()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
-            isRunningState.value = false
             return START_NOT_STICKY
         }
 
@@ -56,8 +63,12 @@ class KeepAliveService : Service() {
         if (timerThread?.isAlive == true) return
         timerThread = thread(start = true) {
             while (isRunningState.value) {
-                Thread.sleep(1000)
-                elapsedSecondsState.value += 1
+                try {
+                    Thread.sleep(1000)
+                    elapsedSecondsState.value += 1
+                } catch (_: InterruptedException) {
+                    break
+                }
             }
         }
     }
@@ -91,22 +102,31 @@ class KeepAliveService : Service() {
             PendingIntent.FLAG_IMMUTABLE
         )
 
+        // مکانیزم ضد حذف: در صورتی که کاربر نوتیفیکیشن را بکشد، فوراً خودش را بازتولید می‌کند
+        val deleteIntent = Intent(this, KeepAliveService::class.java).apply {
+            action = ACTION_RESTORE_NOTIFICATION
+        }
+        val pendingDelete = PendingIntent.getService(
+            this, 2, deleteIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val modeLabel = when(signalModeState.value) {
-            0 -> "سکوت مطلق (PCM 0dB)"
+            0 -> "سکوت دیجیتال (PCM 0dB)"
             1 -> "فرکانس نامحسوس (۱۵ هرتز)"
             else -> "پالس هوشمند صوتی"
         }
 
         val notification = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.drawable.ic_mz_logo)
-            .setContentTitle("سرویس نگه‌دارنده MZ فعال است")
-            .setContentText("سیگنال: $modeLabel")
-            .setOngoing(true) // کاملاً ثابت و غیرقابل کشیدن با دست
+            .setContentTitle("سرویس نگه‌دارنده بلوتوث MZ فعال است")
+            .setContentText("سیگنال جاری: $modeLabel")
+            .setOngoing(true)
             .setAutoCancel(false)
-            .setOnlyAlertOnce(true)
+            .setDeleteIntent(pendingDelete)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(pendingOpen)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "خاموش کردن", pendingStop)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "توقف سرویس", pendingStop)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
 
@@ -144,7 +164,9 @@ class KeepAliveService : Service() {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
-        audioTrack?.play()
+        try {
+            audioTrack?.play()
+        } catch (_: Exception) {}
 
         streamThread = thread(start = true) {
             val buffer = ShortArray(bufferSize)
@@ -152,29 +174,38 @@ class KeepAliveService : Service() {
             val frequency = 15.0
             var pulseTick = 0
 
-            while (isStreaming) {
-                when (mode) {
-                    0 -> buffer.fill(0)
-                    1 -> {
-                        for (i in buffer.indices) {
-                            buffer[i] = (sin(phase) * 1200).toInt().toShort()
-                            phase += 2.0 * Math.PI * frequency / sampleRate
-                            if (phase > 2.0 * Math.PI) phase -= 2.0 * Math.PI
+            try {
+                while (isStreaming && !Thread.currentThread().isInterrupted) {
+                    when (mode) {
+                        0 -> buffer.fill(0)
+                        1 -> {
+                            for (i in buffer.indices) {
+                                buffer[i] = (sin(phase) * 1200).toInt().toShort()
+                                phase += 2.0 * Math.PI * frequency / sampleRate
+                                if (phase > 2.0 * Math.PI) phase -= 2.0 * Math.PI
+                            }
+                        }
+                        2 -> {
+                            pulseTick++
+                            if (pulseTick % 100 < 6) {
+                                for (i in buffer.indices) {
+                                    buffer[i] = (sin(phase) * 800).toInt().toShort()
+                                    phase += 2.0 * Math.PI * 18.0 / sampleRate
+                                }
+                            } else {
+                                buffer.fill(0)
+                            }
                         }
                     }
-                    2 -> {
-                        pulseTick++
-                        if (pulseTick % 100 < 6) {
-                            for (i in buffer.indices) {
-                                buffer[i] = (sin(phase) * 800).toInt().toShort()
-                                phase += 2.0 * Math.PI * 18.0 / sampleRate
-                            }
-                        } else {
-                            buffer.fill(0)
-                        }
+                    val track = audioTrack
+                    if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                        track.write(buffer, 0, buffer.size)
+                    } else {
+                        break
                     }
                 }
-                audioTrack?.write(buffer, 0, buffer.size)
+            } catch (_: Exception) {
+                // خروج ایمن بدون بسته شدن برنامه
             }
         }
     }
@@ -182,14 +213,23 @@ class KeepAliveService : Service() {
     private fun stopAudioStream() {
         isStreaming = false
         try {
+            streamThread?.interrupt()
+            streamThread?.join(300) // منتظر اتمام حلقه می‌ماند تا کرش نکند
+        } catch (_: Exception) {}
+        streamThread = null
+
+        try {
+            audioTrack?.pause()
+            audioTrack?.flush()
             audioTrack?.stop()
             audioTrack?.release()
-            audioTrack = null
-            streamThread?.interrupt()
-            streamThread = null
-            timerThread?.interrupt()
-            timerThread = null
         } catch (_: Exception) {}
+        audioTrack = null
+
+        try {
+            timerThread?.interrupt()
+        } catch (_: Exception) {}
+        timerThread = null
     }
 
     override fun onDestroy() {
