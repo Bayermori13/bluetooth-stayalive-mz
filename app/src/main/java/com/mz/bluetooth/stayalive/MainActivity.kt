@@ -17,13 +17,12 @@ import com.mz.bluetooth.stayalive.ui.MainScreen
 class MainActivity : ComponentActivity() {
 
     private lateinit var bluetoothEngine: BluetoothEngine
-    private var isServiceActive by mutableStateOf(false)
-    private var signalMode by mutableStateOf(1)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         bluetoothEngine.loadPairedDevices()
+        bluetoothEngine.checkActiveCodec()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -32,19 +31,31 @@ class MainActivity : ComponentActivity() {
         requestRequiredPermissions()
 
         setContent {
+            // خواندن همگام و زنده وضعیت سرویس از پس‌زمینه
+            val isRunning by KeepAliveService.isRunningState.collectAsState()
+            val signalMode by KeepAliveService.signalModeState.collectAsState()
+            val elapsedSeconds by KeepAliveService.elapsedSecondsState.collectAsState()
+
             MZBluetoothTheme {
                 MainScreen(
                     engine = bluetoothEngine,
-                    isServiceRunning = isServiceActive,
-                    onToggleService = { toggleKeepAliveService() },
+                    isServiceRunning = isRunning,
+                    runningSeconds = elapsedSeconds,
+                    onToggleService = { toggleKeepAliveService(isRunning, signalMode) },
                     currentMode = signalMode,
                     onSelectMode = { mode ->
-                        signalMode = mode
-                        if (isServiceActive) startServiceWithMode(mode)
+                        KeepAliveService.signalModeState.value = mode
+                        if (isRunning) startServiceWithMode(mode)
                     }
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        bluetoothEngine.loadPairedDevices()
+        bluetoothEngine.checkActiveCodec()
     }
 
     private fun requestRequiredPermissions() {
@@ -60,18 +71,16 @@ class MainActivity : ComponentActivity() {
         permissionLauncher.launch(permissions.toTypedArray())
     }
 
-    private fun toggleKeepAliveService() {
-        if (isServiceActive) {
+    private fun toggleKeepAliveService(isRunning: Boolean, mode: Int) {
+        if (isRunning) {
             val stopIntent = Intent(this, KeepAliveService::class.java).apply {
                 action = KeepAliveService.ACTION_STOP
             }
             startService(stopIntent)
-            isServiceActive = false
-            bluetoothEngine.addLog("سرویس متوقف شد", "سیگنال نگه‌دارنده توسط کاربر خاموش شد", LogType.STOP)
+            bluetoothEngine.addLog("سرویس خاموش شد", "نگه‌دارنده فرکانسی توسط کاربر متوقف گردید", LogType.STOP)
         } else {
-            startServiceWithMode(signalMode)
-            isServiceActive = true
-            bluetoothEngine.addLog("سرویس فعال شد", "نگه‌دارنده دائمی با موفقیت استارت خورد", LogType.SUCCESS)
+            startServiceWithMode(mode)
+            bluetoothEngine.addLog("سرویس روشن شد", "ارسال جریان ممتد برای بیدار نگه داشتن هندزفری آغاز شد", LogType.SUCCESS)
         }
     }
 
