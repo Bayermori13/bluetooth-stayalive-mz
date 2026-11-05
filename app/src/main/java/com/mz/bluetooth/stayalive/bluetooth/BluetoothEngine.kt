@@ -8,15 +8,14 @@ import androidx.compose.runtime.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-// مدل داده‌های دستگاه
 data class BtDeviceModel(
     val name: String,
     val address: String,
     val isConnected: Boolean = false,
-    val rssi: Int = -60
+    val rssi: Int = -60,
+    val isConnecting: Boolean = false
 )
 
-// مدل داده‌های لاگ
 data class LogEntry(
     val id: String = UUID.randomUUID().toString(),
     val time: String,
@@ -25,9 +24,7 @@ data class LogEntry(
     val type: LogType
 )
 
-enum class LogType {
-    SUCCESS, STOP, ERROR, KEEP_ALIVE
-}
+enum class LogType { SUCCESS, STOP, ERROR, KEEP_ALIVE }
 
 class BluetoothEngine(private val context: Context) {
 
@@ -47,12 +44,10 @@ class BluetoothEngine(private val context: Context) {
         setupA2dpProfileListener()
         registerBluetoothReceiver()
         loadPairedDevices()
-        addLog("سرویس لاگ راه‌اندازی شد", "سیستم آماده رصد ارتباط بلوتوث است", LogType.SUCCESS)
+        addLog("سرویس آماده به کار شد", "سیستم آماده شناسایی و اتصال سریع به هندزفری است", LogType.SUCCESS)
     }
 
-    private fun getTime(): String {
-        return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-    }
+    private fun getTime(): String = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
 
     fun addLog(title: String, subtitle: String, type: LogType) {
         logs.add(0, LogEntry(time = getTime(), title = title, subtitle = subtitle, type = type))
@@ -64,9 +59,9 @@ class BluetoothEngine(private val context: Context) {
             pairedDevices.clear()
             bluetoothAdapter?.bondedDevices?.forEach { device ->
                 val isConn = isDeviceConnected(device)
-                val model = BtDeviceModel(device.name ?: "دستگاه ناشناس", device.address, isConn)
+                val model = BtDeviceModel(device.name ?: "هندزفری بدون نام", device.address, isConn)
                 pairedDevices.add(model)
-                if (isConn && activeConnectedDevice == null) {
+                if (isConn) {
                     activeConnectedDevice = model
                     detectAudioCodec(device)
                 }
@@ -92,7 +87,6 @@ class BluetoothEngine(private val context: Context) {
                     checkActiveCodec()
                 }
             }
-
             override fun onServiceDisconnected(profile: Int) {
                 if (profile == BluetoothProfile.A2DP) a2dpProfile = null
             }
@@ -108,10 +102,11 @@ class BluetoothEngine(private val context: Context) {
                 activeConnectedDevice = BtDeviceModel(dev.name ?: "هندزفری متصل", dev.address, true)
                 detectAudioCodec(dev)
             } else {
+                activeConnectedDevice = null
                 currentCodecName = "دستگاهی متصل نیست"
             }
         } catch (_: Exception) {
-            currentCodecName = "پروتکل استاندارد A2DP"
+            currentCodecName = "پروتکل استاندارد صوتی"
         }
     }
 
@@ -134,13 +129,32 @@ class BluetoothEngine(private val context: Context) {
                         3 -> "Qualcomm aptX HD"
                         4 -> "Sony LDAC (فوق پیشرفته 990kbps)"
                         5 -> "LC3 (نسل جدید LE Audio)"
-                        else -> "کدک سفارشی با پهنای باند بالا"
+                        else -> "کدک HD سفارشی"
                     }
                     return
                 }
             } catch (_: Exception) {}
         }
         currentCodecName = "A2DP High Quality Audio"
+    }
+
+    // قابلیت اتصال مستقیم به دستگاه از داخل برنامه
+    @SuppressLint("MissingPermission")
+    fun connectToDevice(address: String) {
+        val device = bluetoothAdapter?.getRemoteDevice(address) ?: return
+        addLog("تلاش برای اتصال...", "در حال برقراری ارتباط صوتی مستقیم با ${device.name ?: address}", LogType.KEEP_ALIVE)
+
+        try {
+            if (device.bondState == BluetoothDevice.BOND_NONE) {
+                device.createBond()
+            }
+            if (a2dpProfile != null) {
+                val connectMethod = a2dpProfile?.javaClass?.getMethod("connect", BluetoothDevice::class.java)
+                connectMethod?.invoke(a2dpProfile, device)
+            }
+        } catch (e: Exception) {
+            addLog("خطا در اتصال مستقیم", e.localizedMessage ?: "دسترسی صوتی برقرار نشد", LogType.ERROR)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -150,9 +164,9 @@ class BluetoothEngine(private val context: Context) {
             scannedDevices.clear()
             bluetoothAdapter?.startDiscovery()
             isScanning = true
-            addLog("اسکن محیطی آغاز شد", "در حال جستجوی امواج هندزفری‌های مجاور...", LogType.KEEP_ALIVE)
+            addLog("اسکن محیطی آغاز شد", "در حال یافتن امواج هندزفری‌های اطراف...", LogType.KEEP_ALIVE)
         } catch (_: Exception) {
-            addLog("خطا در اسکن", "مجوزهای مکان یا اسکن تایید نشده‌اند", LogType.ERROR)
+            addLog("خطا در اسکن", "لطفاً بلوتوث و لوکیشن گوشی را روشن کنید", LogType.ERROR)
         }
     }
 
@@ -171,6 +185,7 @@ class BluetoothEngine(private val context: Context) {
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED)
             addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED)
             addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
         }
 
         context.registerReceiver(object : BroadcastReceiver() {
@@ -179,9 +194,9 @@ class BluetoothEngine(private val context: Context) {
                 when (intent?.action) {
                     BluetoothDevice.ACTION_FOUND -> {
                         val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-                        val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE).toInt()
+                        val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, (-65).toShort()).toInt()
                         device?.let {
-                            val name = it.name ?: "دستگاه بدون نام"
+                            val name = it.name ?: "دستگاه صوتی مجاور"
                             val model = BtDeviceModel(name, it.address, false, rssi)
                             if (scannedDevices.none { d -> d.address == it.address }) {
                                 scannedDevices.add(model)
@@ -192,19 +207,23 @@ class BluetoothEngine(private val context: Context) {
                         val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
                         val name = dev?.name ?: "هندزفری"
                         activeConnectedDevice = BtDeviceModel(name, dev?.address ?: "", true)
+                        loadPairedDevices()
                         dev?.let { detectAudioCodec(it) }
-                        addLog("اتصال برقرار شد", "$name با موفقیت متصل شد و آماده نگه‌داری است", LogType.SUCCESS)
+                        addLog("اتصال برقرار شد", "$name به سیستم متصل شد - محافظت فعال است", LogType.SUCCESS)
                     }
                     BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED -> {
                         val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-                        addLog("تلاش برای قطع اتصال!", "${dev?.name} قصد قطع خودکار داشت - پالس محافظ فعال شد", LogType.KEEP_ALIVE)
+                        addLog("هشدار قطع!", "${dev?.name} قصد خاموشی داشت؛ پالس نگهدارنده تزریق شد", LogType.KEEP_ALIVE)
                     }
                     BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
                         val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-                        val name = dev?.name ?: "هندزفری"
                         activeConnectedDevice = null
                         currentCodecName = "دستگاهی متصل نیست"
-                        addLog("ارتباط قطع شد", "سیگنال هندزفری $name قطع شد", LogType.ERROR)
+                        loadPairedDevices()
+                        addLog("ارتباط قطع شد", "ارتباط با ${dev?.name} پایان یافت", LogType.ERROR)
+                    }
+                    BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                        loadPairedDevices()
                     }
                     BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
                         isScanning = false
