@@ -5,6 +5,7 @@ import android.bluetooth.*
 import android.content.*
 import android.os.Build
 import androidx.compose.runtime.*
+import kotlinx.coroutines.*
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -12,8 +13,7 @@ data class BtDeviceModel(
     val name: String,
     val address: String,
     val isConnected: Boolean = false,
-    val rssi: Int = -60,
-    val isConnecting: Boolean = false
+    val rssi: Int = -60
 )
 
 data class LogEntry(
@@ -36,9 +36,11 @@ class BluetoothEngine(private val context: Context) {
     var activeConnectedDevice by mutableStateOf<BtDeviceModel?>(null)
     var currentCodecName by mutableStateOf("در حال بررسی...")
     var isScanning by mutableStateOf(false)
+    var connectingAddress by mutableStateOf<String?>(null) // آدرس دستگاهی که در حال اتصال به آن هستیم
     val logs = mutableStateListOf<LogEntry>()
 
     private var a2dpProfile: BluetoothA2dp? = null
+    private val scope = CoroutineScope(Dispatchers.Main + Job())
 
     init {
         setupA2dpProfileListener()
@@ -124,11 +126,11 @@ class BluetoothEngine(private val context: Context) {
 
                     currentCodecName = when (type) {
                         0 -> "SBC (استاندارد بلوتوث)"
-                        1 -> "AAC (کیفیت و شفافیت بالا)"
+                        1 -> "AAC (شفافیت بالا)"
                         2 -> "Qualcomm aptX"
                         3 -> "Qualcomm aptX HD"
                         4 -> "Sony LDAC (فوق پیشرفته 990kbps)"
-                        5 -> "LC3 (نسل جدید LE Audio)"
+                        5 -> "LC3 (LE Audio)"
                         else -> "کدک HD سفارشی"
                     }
                     return
@@ -138,22 +140,29 @@ class BluetoothEngine(private val context: Context) {
         currentCodecName = "A2DP High Quality Audio"
     }
 
-    // قابلیت اتصال مستقیم به دستگاه از داخل برنامه
     @SuppressLint("MissingPermission")
     fun connectToDevice(address: String) {
         val device = bluetoothAdapter?.getRemoteDevice(address) ?: return
-        addLog("تلاش برای اتصال...", "در حال برقراری ارتباط صوتی مستقیم با ${device.name ?: address}", LogType.KEEP_ALIVE)
+        connectingAddress = address
+        addLog("در حال اتصال صوتی...", "در حال برقراری اتصال با ${device.name ?: address}", LogType.KEEP_ALIVE)
 
-        try {
-            if (device.bondState == BluetoothDevice.BOND_NONE) {
-                device.createBond()
+        scope.launch(Dispatchers.IO) {
+            try {
+                if (device.bondState == BluetoothDevice.BOND_NONE) {
+                    device.createBond()
+                }
+                if (a2dpProfile != null) {
+                    val connectMethod = a2dpProfile?.javaClass?.getMethod("connect", BluetoothDevice::class.java)
+                    connectMethod?.invoke(a2dpProfile, device)
+                }
+                delay(6000)
+                if (connectingAddress == address) {
+                    connectingAddress = null
+                }
+            } catch (e: Exception) {
+                connectingAddress = null
+                addLog("خطا در اتصال", e.localizedMessage ?: "پاسخی دریافت نشد", LogType.ERROR)
             }
-            if (a2dpProfile != null) {
-                val connectMethod = a2dpProfile?.javaClass?.getMethod("connect", BluetoothDevice::class.java)
-                connectMethod?.invoke(a2dpProfile, device)
-            }
-        } catch (e: Exception) {
-            addLog("خطا در اتصال مستقیم", e.localizedMessage ?: "دسترسی صوتی برقرار نشد", LogType.ERROR)
         }
     }
 
@@ -166,7 +175,7 @@ class BluetoothEngine(private val context: Context) {
             isScanning = true
             addLog("اسکن محیطی آغاز شد", "در حال یافتن امواج هندزفری‌های اطراف...", LogType.KEEP_ALIVE)
         } catch (_: Exception) {
-            addLog("خطا در اسکن", "لطفاً بلوتوث و لوکیشن گوشی را روشن کنید", LogType.ERROR)
+            addLog("خطا در اسکن", "لطفاً بلوتوث و مکان گوشی را روشن کنید", LogType.ERROR)
         }
     }
 
@@ -206,17 +215,19 @@ class BluetoothEngine(private val context: Context) {
                     BluetoothDevice.ACTION_ACL_CONNECTED -> {
                         val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
                         val name = dev?.name ?: "هندزفری"
+                        connectingAddress = null
                         activeConnectedDevice = BtDeviceModel(name, dev?.address ?: "", true)
                         loadPairedDevices()
                         dev?.let { detectAudioCodec(it) }
-                        addLog("اتصال برقرار شد", "$name به سیستم متصل شد - محافظت فعال است", LogType.SUCCESS)
+                        addLog("اتصال برقرار شد", "$name متصل شد - محافظت فعال است", LogType.SUCCESS)
                     }
                     BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED -> {
                         val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
-                        addLog("هشدار قطع!", "${dev?.name} قصد خاموشی داشت؛ پالس نگهدارنده تزریق شد", LogType.KEEP_ALIVE)
+                        addLog("هشدار قطع!", "${dev?.name} قصد خاموشی داشت؛ پالس نگهدارنده مانع شد", LogType.KEEP_ALIVE)
                     }
                     BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
                         val dev = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                        connectingAddress = null
                         activeConnectedDevice = null
                         currentCodecName = "دستگاهی متصل نیست"
                         loadPairedDevices()
